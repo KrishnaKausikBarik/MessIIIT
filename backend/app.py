@@ -14,6 +14,11 @@ import bcrypt
 import jwt
 from flask import Flask, g, jsonify, make_response, request, send_from_directory
 
+try:
+    from psycopg import OperationalError as PsycopgOperationalError
+except ImportError:
+    PsycopgOperationalError = None
+
 ROOT = Path(__file__).resolve().parent.parent
 DATABASE_URL = os.getenv("DATABASE_URL")
 DB_FILE = Path(os.getenv("DB_FILE", ROOT / "data" / "mess.db"))
@@ -181,6 +186,14 @@ def headers(response):
 @app.errorhandler(404)
 def not_found(_):
     return error(404, "Not found")
+
+def database_unavailable(_):
+    # Keep connection details out of client responses and application logs.
+    app.logger.error("PostgreSQL connection failed; verify DATABASE_URL and database availability")
+    return error(503, "Database is temporarily unavailable. Please try again shortly.")
+
+if PsycopgOperationalError is not None:
+    app.register_error_handler(PsycopgOperationalError, database_unavailable)
 
 @app.post("/api/login")
 def login():
