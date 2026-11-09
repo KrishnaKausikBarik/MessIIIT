@@ -2,5 +2,6 @@ node_modules/
 data/
 .env
 .venv/
+.vercel/
 __pycache__/
 *.py[cod]

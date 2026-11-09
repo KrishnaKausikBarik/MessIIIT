@@ -39,15 +39,30 @@ Optional demo accounts:
 python backend\seed_demo.py
 ```
 
+## Deploy on Vercel
+
+This repository includes a Vercel entry point and a build step that copies `frontend/` assets into `public/`. In Vercel, import this repository and configure **Root Directory** as `.` (the repository root) and **Framework Preset** as `Flask`.
+
+The app uses local SQLite for local development. Vercel functions do not provide persistent local storage, so connect a hosted PostgreSQL database through the Vercel Marketplace and expose its connection string as `DATABASE_URL` before deploying. Set these environment variables in Vercel:
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | Hosted PostgreSQL connection string |
+| `JWT_SECRET` | Long random key used to sign login tokens |
+| `ADMIN_PASSWORD` | Password for the first admin created in the hosted database |
+
+The schema, default menu, and admin account are created on the first request. The local SQLite database and demo accounts are not copied to production; add student accounts from the admin dashboard after deployment.
+
 ## Configuration
 
 | Variable | Default | Purpose |
 |---|---|---|
 | `PORT` | `3000` | HTTP port |
 | `MESS_TZ` | `Asia/Kolkata` | Timezone for meal times and cutoffs |
-| `ADMIN_PASSWORD` | Generated | Initial admin password |
-| `JWT_SECRET` | Stored in SQLite | Override token signing key |
+| `ADMIN_PASSWORD` | `admin@123` locally; required on Vercel | Initial admin password |
+| `JWT_SECRET` | Stored in SQLite locally; required on Vercel | Token signing key |
 | `DB_FILE` | `data/mess.db` | SQLite database path |
+| `DATABASE_URL` | Unset | PostgreSQL URL; use this for Vercel or hosted databases |
 | `HOSTELS` | Hostel A, Hostel B, Hostel C, Day scholar | Comma-separated hostel list |
 
 Meal timings and prices, plus the default menu, are configured near the top of `backend/app.py`. The API paths and JSON payloads remain compatible with the existing frontend.

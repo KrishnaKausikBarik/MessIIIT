@@ -15,8 +15,10 @@ import jwt
 from flask import Flask, g, jsonify, make_response, request, send_from_directory
 
 ROOT = Path(__file__).resolve().parent.parent
+DATABASE_URL = os.getenv("DATABASE_URL")
 DB_FILE = Path(os.getenv("DB_FILE", ROOT / "data" / "mess.db"))
-DB_FILE.parent.mkdir(parents=True, exist_ok=True)
+if not DATABASE_URL:
+    DB_FILE.parent.mkdir(parents=True, exist_ok=True)
 FRONTEND = ROOT / "frontend"
 TZ = ZoneInfo(os.getenv("MESS_TZ", "Asia/Kolkata"))
 SECRET = os.getenv("JWT_SECRET")
@@ -38,23 +40,59 @@ DEFAULT_MENU = {
 }
 app = Flask(__name__, static_folder=None)
 
+def open_db():
+    if DATABASE_URL:
+        import psycopg
+        from psycopg.rows import dict_row
+        return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    db = sqlite3.connect(DB_FILE)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA foreign_keys=ON")
+    return db
+
+def execute(db, sql, params=()):
+    if DATABASE_URL:
+        if sql.lstrip().upper().startswith("INSERT OR IGNORE INTO"):
+            sql = sql.replace("INSERT OR IGNORE INTO", "INSERT INTO", 1).rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+        sql = sql.replace("?", "%s")
+    return db.execute(sql, params)
+
 def connect():
     if "db" not in g:
-        g.db = sqlite3.connect(DB_FILE)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys=ON")
+        g.db = open_db()
     return g.db
 
 @app.teardown_appcontext
-def close_db(_=None):
+def close_db(exc=None):
     db = g.pop("db", None)
     if db:
+        if exc is None:
+            db.commit()
+        else:
+            db.rollback()
         db.close()
 
 def init_db():
-    db = sqlite3.connect(DB_FILE)
-    db.execute("PRAGMA journal_mode=WAL")
-    db.executescript("""
+    global SECRET
+    if os.getenv("VERCEL") and not DATABASE_URL:
+        raise RuntimeError("Set DATABASE_URL to a persistent PostgreSQL database before deploying on Vercel")
+    if DATABASE_URL and not SECRET:
+        raise RuntimeError("Set JWT_SECRET in the Vercel project environment variables")
+    db = open_db()
+    if DATABASE_URL:
+        schema = [
+            "CREATE TABLE IF NOT EXISTS users(id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL,roll TEXT NOT NULL UNIQUE,hostel TEXT NOT NULL DEFAULT '',role TEXT NOT NULL CHECK(role IN ('student','admin')),pw TEXT NOT NULL,created TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE IF NOT EXISTS menu(day INTEGER NOT NULL CHECK(day BETWEEN 0 AND 6),meal INTEGER NOT NULL CHECK(meal BETWEEN 0 AND 3),items TEXT NOT NULL,PRIMARY KEY(day,meal))",
+            "CREATE TABLE IF NOT EXISTS skips(user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,date TEXT NOT NULL,meal TEXT NOT NULL,PRIMARY KEY(user_id,date,meal))",
+            "CREATE TABLE IF NOT EXISTS feedback(id BIGSERIAL PRIMARY KEY,user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,date TEXT NOT NULL,meal TEXT NOT NULL,rating INTEGER NOT NULL CHECK(rating BETWEEN 1 AND 5),text TEXT NOT NULL DEFAULT '',resolved INTEGER NOT NULL DEFAULT 0,created TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP)",
+            "CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS idx_skips_date ON skips(date)",
+        ]
+        for statement in schema:
+            db.execute(statement)
+    else:
+        db.execute("PRAGMA journal_mode=WAL")
+        db.executescript("""
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT NOT NULL,roll TEXT NOT NULL UNIQUE,hostel TEXT NOT NULL DEFAULT '',role TEXT NOT NULL CHECK(role IN ('student','admin')),pw TEXT NOT NULL,created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
     CREATE TABLE IF NOT EXISTS menu(day INTEGER NOT NULL CHECK(day BETWEEN 0 AND 6),meal INTEGER NOT NULL CHECK(meal BETWEEN 0 AND 3),items TEXT NOT NULL,PRIMARY KEY(day,meal));
     CREATE TABLE IF NOT EXISTS skips(user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,date TEXT NOT NULL,meal TEXT NOT NULL,PRIMARY KEY(user_id,date,meal));
@@ -62,13 +100,27 @@ def init_db():
     CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY,v TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_skips_date ON skips(date);
     """)
-    if not db.execute("SELECT 1 FROM menu LIMIT 1").fetchone():
-        db.executemany("INSERT INTO menu(day,meal,items) VALUES(?,?,?)", [(d, i, v) for d, values in DEFAULT_MENU.items() for i, v in enumerate(values)])
-    if not db.execute("SELECT 1 FROM users WHERE role='admin' LIMIT 1").fetchone():
-        pw = os.getenv("ADMIN_PASSWORD") or "admin@123"
+    if not execute(db, "SELECT 1 FROM menu LIMIT 1").fetchone():
+        for d, values in DEFAULT_MENU.items():
+            for i, value in enumerate(values):
+                execute(db, "INSERT INTO menu(day,meal,items) VALUES(?,?,?) ON CONFLICT(day,meal) DO NOTHING", (d, i, value))
+    if not execute(db, "SELECT 1 FROM users WHERE role='admin' LIMIT 1").fetchone():
+        pw = os.getenv("ADMIN_PASSWORD")
+        if not pw and os.getenv("VERCEL"):
+            raise RuntimeError("Set ADMIN_PASSWORD in the Vercel project environment variables")
+        pw = pw or "admin@123"
         hashed = bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()
-        db.execute("INSERT INTO users(name,roll,hostel,role,pw) VALUES('Mess Office','ADMIN','Office','admin',?)", (hashed,))
+        execute(db, "INSERT INTO users(name,roll,hostel,role,pw) VALUES('Mess Office','ADMIN','Office','admin',?) ON CONFLICT(roll) DO NOTHING", (hashed,))
         print(f"\nCreated admin account\nRoll number: ADMIN\nPassword: {pw}\nChange this password after signing in.\n")
+    if not DATABASE_URL and not SECRET:
+        row = execute(db, "SELECT v FROM settings WHERE k='jwt_secret'").fetchone()
+        if row:
+            SECRET = row["v"]
+        else:
+            SECRET = SECRET or secrets.token_hex(48)
+            execute(db, "INSERT INTO settings(k,v) VALUES('jwt_secret',?) ON CONFLICT(k) DO NOTHING", (SECRET,))
+    else:
+        SECRET = os.getenv("JWT_SECRET")
     db.commit()
     db.close()
 
@@ -100,7 +152,7 @@ def auth(role=None):
                 # that legacy claim while validating and converting it below.
                 payload = jwt.decode(token, SECRET, algorithms=["HS256"], options={"verify_sub": False})
                 user_id = int(payload["sub"])
-                user = connect().execute("SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
+                user = execute(connect(), "SELECT * FROM users WHERE id=?", (user_id,)).fetchone()
                 if not user:
                     raise ValueError()
                 if role and user["role"] != role:
@@ -115,6 +167,9 @@ def auth(role=None):
 
 @app.before_request
 def security_headers():
+    if not app.config.get("database_ready"):
+        init_db()
+        app.config["database_ready"] = True
     if request.content_length and request.content_length > 10 * 1024:
         return error(400, "Invalid request body")
 
@@ -141,7 +196,7 @@ def login():
     requested_role = data.get("role")
     if requested_role not in (None, "student", "admin"):
         return error(400, "Choose Student or Admin")
-    u = connect().execute("SELECT * FROM users WHERE roll=?", (clean(data.get("roll"), 40).upper(),)).fetchone()
+    u = execute(connect(), "SELECT * FROM users WHERE roll=?", (clean(data.get("roll"), 40).upper(),)).fetchone()
     try:
         valid = u and bcrypt.checkpw(str(data.get("password") or "").encode(), u["pw"].encode())
     except ValueError:
@@ -161,7 +216,7 @@ def password():
     new = str(data.get("next") or "")
     if len(new) < 8:
         return error(400, "New password must be at least 8 characters")
-    connect().execute("UPDATE users SET pw=? WHERE id=?", (bcrypt.hashpw(new.encode(), bcrypt.gensalt()).decode(), g.user["id"]))
+    execute(connect(), "UPDATE users SET pw=? WHERE id=?", (bcrypt.hashpw(new.encode(), bcrypt.gensalt()).decode(), g.user["id"]))
     return "", 204
 
 def hour_label(hour):
@@ -175,16 +230,16 @@ def bootstrap():
     admin = u["role"] == "admin"
     month_start = now_parts()["date"][:7] + "-01"
     menu = {}
-    for r in db.execute("SELECT day,meal,items FROM menu"):
+    for r in execute(db, "SELECT day,meal,items FROM menu"):
         menu.setdefault(str(r["day"]), [None] * 4)[r["meal"]] = r["items"]
     params = () if admin else (u["id"],)
     clause = "" if admin else " AND id=?"
-    students = [dict(r) for r in db.execute("SELECT id,name,roll,hostel FROM users WHERE role='student'" + clause + " ORDER BY roll", params)]
+    students = [dict(r) for r in execute(db, "SELECT id,name,roll,hostel FROM users WHERE role='student'" + clause + " ORDER BY roll", params)]
     skips = {}
     sql = "SELECT user_id,date,meal FROM skips WHERE date>=?" + ("" if admin else " AND user_id=?")
-    for r in db.execute(sql, (month_start,) + params):
+    for r in execute(db, sql, (month_start,) + params):
         skips.setdefault(str(r["user_id"]), {})[r["date"] + "|" + r["meal"]] = 1
-    fs = db.execute("SELECT f.id,f.user_id AS sid,f.date,f.meal,f.rating,f.text,f.resolved,u.name AS author,u.hostel FROM feedback f JOIN users u ON u.id=f.user_id " + ("" if admin else "WHERE f.user_id=? ") + "ORDER BY f.id DESC LIMIT 300", params)
+    fs = execute(db, "SELECT f.id,f.user_id AS sid,f.date,f.meal,f.rating,f.text,f.resolved,u.name AS author,u.hostel FROM feedback f JOIN users u ON u.id=f.user_id " + ("" if admin else "WHERE f.user_id=? ") + "ORDER BY f.id DESC LIMIT 300", params)
     feedback = [{**dict(r), "resolved": bool(r["resolved"])} for r in fs]
     meals = [{**m, "label": f"{hour_label(m['start'])}–{hour_label(m['end'])}"} for m in MEALS]
     return jsonify(user=public_user(u), hostels=HOSTELS, now=now_parts(), menu=menu, students=students, skips=skips, fb=feedback, meals=meals)
@@ -211,7 +266,7 @@ def check_skip(ds, meal):
 def add_skip():
     d = body(); msg = check_skip(d.get("date"), d.get("meal"))
     if msg: return error(400, msg)
-    connect().execute("INSERT OR IGNORE INTO skips(user_id,date,meal) VALUES(?,?,?)", (g.user["id"], d["date"], d["meal"]))
+    execute(connect(), "INSERT OR IGNORE INTO skips(user_id,date,meal) VALUES(?,?,?)", (g.user["id"], d["date"], d["meal"]))
     return "", 204
 
 @app.delete("/api/skips/<ds>/<meal>")
@@ -219,7 +274,7 @@ def add_skip():
 def remove_skip(ds, meal):
     msg = check_skip(ds, meal)
     if msg: return error(400, msg)
-    connect().execute("DELETE FROM skips WHERE user_id=? AND date=? AND meal=?", (g.user["id"], ds, meal))
+    execute(connect(), "DELETE FROM skips WHERE user_id=? AND date=? AND meal=?", (g.user["id"], ds, meal))
     return "", 204
 
 @app.post("/api/feedback")
@@ -231,13 +286,15 @@ def add_feedback():
     if meal not in [m["id"] for m in MEALS]: return error(400, "Choose a meal")
     if rating < 1 or rating > 5: return error(400, "Rating must be 1 to 5")
     today = now_parts()["date"]
-    cur = connect().execute("INSERT INTO feedback(user_id,date,meal,rating,text) VALUES(?,?,?,?,?)", (g.user["id"], today, meal, rating, text))
-    return jsonify(id=cur.lastrowid, sid=g.user["id"], date=today, meal=meal, rating=rating, text=text, resolved=False, author=g.user["name"], hostel=g.user["hostel"]), 201
+    db = connect()
+    cur = execute(db, "INSERT INTO feedback(user_id,date,meal,rating,text) VALUES(?,?,?,?,?)" + (" RETURNING id" if DATABASE_URL else ""), (g.user["id"], today, meal, rating, text))
+    feedback_id = cur.fetchone()["id"] if DATABASE_URL else cur.lastrowid
+    return jsonify(id=feedback_id, sid=g.user["id"], date=today, meal=meal, rating=rating, text=text, resolved=False, author=g.user["name"], hostel=g.user["hostel"]), 201
 
 @app.patch("/api/feedback/<int:fid>")
 @auth("admin")
 def resolve_feedback(fid):
-    cur = connect().execute("UPDATE feedback SET resolved=? WHERE id=?", (int(bool(body().get("resolved"))), fid))
+    cur = execute(connect(), "UPDATE feedback SET resolved=? WHERE id=?", (int(bool(body().get("resolved"))), fid))
     return ("", 204) if cur.rowcount else error(404, "Feedback not found")
 
 @app.put("/api/menu")
@@ -249,7 +306,7 @@ def update_menu():
     items = clean(d.get("items"), 300)
     if day < 0 or day > 6 or meal < 0 or meal >= len(MEALS): return error(400, "Invalid day or meal")
     if not items: return error(400, "Add at least one dish")
-    connect().execute("INSERT INTO menu(day,meal,items) VALUES(?,?,?) ON CONFLICT(day,meal) DO UPDATE SET items=excluded.items", (day, meal, items))
+    execute(connect(), "INSERT INTO menu(day,meal,items) VALUES(?,?,?) ON CONFLICT(day,meal) DO UPDATE SET items=excluded.items", (day, meal, items))
     return jsonify(day=day, meal=meal, items=items)
 
 @app.post("/api/students")
@@ -260,14 +317,15 @@ def add_student():
     if not re.fullmatch(r"[A-Z0-9_-]+", roll): return error(400, "Roll number can use letters, digits, - and _ only")
     if len(pw) < 8: return error(400, "Temporary password must be at least 8 characters")
     db = connect()
-    if db.execute("SELECT 1 FROM users WHERE roll=?", (roll,)).fetchone(): return error(409, "That roll number is already registered")
-    cur = db.execute("INSERT INTO users(name,roll,hostel,role,pw) VALUES(?,?,?,'student',?)", (name, roll, hostel, bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()))
-    return jsonify(id=cur.lastrowid, name=name, roll=roll, hostel=hostel), 201
+    if execute(db, "SELECT 1 FROM users WHERE roll=?", (roll,)).fetchone(): return error(409, "That roll number is already registered")
+    cur = execute(db, "INSERT INTO users(name,roll,hostel,role,pw) VALUES(?,?,?,'student',?)" + (" RETURNING id" if DATABASE_URL else ""), (name, roll, hostel, bcrypt.hashpw(pw.encode(), bcrypt.gensalt()).decode()))
+    student_id = cur.fetchone()["id"] if DATABASE_URL else cur.lastrowid
+    return jsonify(id=student_id, name=name, roll=roll, hostel=hostel), 201
 
 @app.delete("/api/students/<int:sid>")
 @auth("admin")
 def delete_student(sid):
-    cur = connect().execute("DELETE FROM users WHERE id=? AND role='student'", (sid,))
+    cur = execute(connect(), "DELETE FROM users WHERE id=? AND role='student'", (sid,))
     return ("", 204) if cur.rowcount else error(404, "Student not found")
 
 def csv_cell(value):
@@ -280,8 +338,8 @@ def report():
     month = request.args.get("month", "")
     if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month): month = now_parts()["date"][:7]
     y, mo = map(int, month.split("-")); days = (date(y + (mo == 12), mo % 12 + 1, 1) - timedelta(days=1)).day
-    db = connect(); students = db.execute("SELECT id,name,roll,hostel FROM users WHERE role='student' ORDER BY roll")
-    skipped = {r["k"] for r in db.execute("SELECT user_id||'|'||date||'|'||meal AS k FROM skips WHERE date LIKE ?", (month + "-%",))}
+    db = connect(); students = execute(db, "SELECT id,name,roll,hostel FROM users WHERE role='student' ORDER BY roll")
+    skipped = {f"{r['user_id']}|{r['date']}|{r['meal']}" for r in execute(db, "SELECT user_id,date,meal FROM skips WHERE date LIKE ?", (month + "-%",))}
     output = io.StringIO(newline=""); writer = csv.writer(output)
     writer.writerow(["Roll no", "Name", "Hostel", *[m["name"] + " eaten" for m in MEALS], "Meals skipped", "Total (INR)"])
     t = now_parts()
@@ -309,12 +367,5 @@ def static_files(filename):
 
 if __name__ == "__main__":
     init_db()
-    if not SECRET:
-        db = sqlite3.connect(DB_FILE)
-        row = db.execute("SELECT v FROM settings WHERE k='jwt_secret'").fetchone()
-        if row: SECRET = row[0]
-        else:
-            SECRET = secrets.token_hex(48)
-            db.execute("INSERT INTO settings(k,v) VALUES('jwt_secret',?)", (SECRET,)); db.commit()
-        db.close()
+    app.config["database_ready"] = True
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "3000")), debug=False)
