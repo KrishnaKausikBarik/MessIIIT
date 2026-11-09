@@ -41,17 +41,19 @@ python backend\seed_demo.py
 
 ## Deploy on Vercel
 
-This repository includes a Vercel entry point and a build step that copies `frontend/` assets into `public/`. In Vercel, import this repository and configure **Root Directory** as `.` (the repository root) and **Framework Preset** as `Flask`.
+This repository is configured for Vercel. The build command copies `frontend/` into `public/` so Vercel serves the page and assets from its CDN; Vercel detects the Flask app in `backend/app.py` and runs the API as a Python Function. Python 3.12 is pinned in `.python-version`.
 
-The app uses local SQLite for local development. Vercel functions do not provide persistent local storage, so connect a hosted PostgreSQL database through the Vercel Marketplace and expose its connection string as `DATABASE_URL` before deploying. Set these environment variables in Vercel:
+Import the repository into Vercel and use the repository root as **Root Directory**. Let Vercel detect Flask (or select the Flask preset if prompted). The checked-in `vercel.json` supplies the asset build command.
+
+The app uses local SQLite for local development. Vercel functions do not provide persistent local storage, so provision a hosted PostgreSQL database (for example, through the Vercel Marketplace) and add its connection string as `DATABASE_URL` in the Vercel project settings. Set the variables for Production and Preview as needed, then redeploy:
 
 | Variable | Purpose |
 |---|---|
 | `DATABASE_URL` | Hosted PostgreSQL connection string |
-| `JWT_SECRET` | Long random key used to sign login tokens |
-| `ADMIN_PASSWORD` | Password for the first admin created in the hosted database |
+| `JWT_SECRET` | Long, random key used to sign login tokens. Generate a unique value and keep it private. |
+| `ADMIN_PASSWORD` | Strong password for the first admin created in the hosted database |
 
-The schema, default menu, and admin account are created on the first request. The local SQLite database and demo accounts are not copied to production; add student accounts from the admin dashboard after deployment.
+The schema, default menu, and admin account are created on the first API request. Sign in as `ADMIN` with the `ADMIN_PASSWORD` value, then add student accounts from the admin dashboard. The local SQLite database and demo accounts are not copied to production. Keep `DATABASE_URL` and `JWT_SECRET` stable across deployments so data and existing login tokens continue to work.
 
 ## Configuration
 
