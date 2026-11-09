@@ -9,3 +9,9 @@ dependencies = [
   "tzdata>=2024.1",
   "psycopg[binary]>=3.2,<4",
 ]
+
+[tool.vercel]
+entrypoint = "backend.app:app"
+
+[tool.vercel.scripts]
+build = "python build_vercel.py"
